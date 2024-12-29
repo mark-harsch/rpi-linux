@@ -109,6 +109,13 @@ struct sifive_fu540_macb_mgmt {
 		- SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
 #define GEM_RX_PAGE_FRAMES_PER_PAGE (PAGE_SIZE / GEM_RX_PAGE_MAX_FRAME_SIZE)
 
+enum gem_xdp_verdict {
+	PASS = 0,
+	TX = 1,
+	REDIRECT = 2,
+	DROPPED = 3,
+};
+
 /* DMA buffer descriptor might be different size
  * depends on hardware configuration:
  *
@@ -203,10 +210,10 @@ static struct macb_dma_desc *macb_tx_desc(struct macb_queue *queue,
 	return &queue->tx_ring[index];
 }
 
-static struct macb_tx_skb *macb_tx_skb(struct macb_queue *queue,
+static struct macb_tx_buf *macb_tx_buf(struct macb_queue *queue,
 				       unsigned int index)
 {
-	return &queue->tx_skb[macb_tx_ring_wrap(queue->bp, index)];
+	return &queue->tx_buf[macb_tx_ring_wrap(queue->bp, index)];
 }
 
 static dma_addr_t macb_tx_dma(struct macb_queue *queue, unsigned int index)
@@ -1059,22 +1066,45 @@ static int macb_halt_tx(struct macb *bp)
 	return -ETIMEDOUT;
 }
 
-static void macb_tx_unmap(struct macb *bp, struct macb_tx_skb *tx_skb, int budget)
+static void macb_tx_unmap(struct macb *bp, struct macb_tx_buf *tx_buf, int budget, bool napi_context)
 {
-	if (tx_skb->mapping) {
-		if (tx_skb->mapped_as_page)
-			dma_unmap_page(&bp->pdev->dev, tx_skb->mapping,
-				       tx_skb->size, DMA_TO_DEVICE);
-		else
-			dma_unmap_single(&bp->pdev->dev, tx_skb->mapping,
-					 tx_skb->size, DMA_TO_DEVICE);
-		tx_skb->mapping = 0;
+	if (tx_buf->mapping) {
+		if (tx_buf->type == TX_TYPE_SKB && tx_buf->mapped_as_page) {
+			dma_unmap_page(&bp->pdev->dev, tx_buf->mapping,
+				       tx_buf->size, DMA_TO_DEVICE);
+		}
+		if (tx_buf->type == TX_TYPE_XDP_NDO ||
+		    (tx_buf->type == TX_TYPE_SKB && !tx_buf->mapped_as_page)) {
+			dma_unmap_single(&bp->pdev->dev, tx_buf->mapping,
+					 tx_buf->size, DMA_TO_DEVICE);
+		}
+
+		tx_buf->mapping = 0;
 	}
 
-	if (tx_skb->skb) {
-		napi_consume_skb(tx_skb->skb, budget);
-		tx_skb->skb = NULL;
+	if (tx_buf->skb) {
+		napi_consume_skb(tx_buf->skb, budget);
+		tx_buf->skb = NULL;
 	}
+	if (tx_buf->xdp_frame) {
+		// if (tx_buf->type == TX_TYPE_XDP_NDO || tx_buf->type == TX_TYPE_XDP_TX) {
+			if (napi_context && tx_buf->type == TX_TYPE_XDP_TX) {
+				xdp_return_frame_rx_napi(tx_buf->xdp_frame);
+			}
+			else {
+				xdp_return_frame(tx_buf->xdp_frame); // TODO: do bulk release handling
+			}
+		// }
+		// if (tx_buf->type == TX_TYPE_XDP_NDO) {
+		// 	xdp_return_frame_rx_napi(tx_buf->xdp_frame);
+		// }
+		// if (tx_buf->type == TX_TYPE_XDP_TX) {
+		// 	xdp_return_frame_bulk(tx_buf->xdp_frame, xdp_fbulk);
+		// }
+		tx_buf->xdp_frame = NULL;
+	}
+
+	tx_buf->type = TX_TYPE_UNUSED;
 }
 
 static void macb_set_addr(struct macb *bp, struct macb_dma_desc *desc, dma_addr_t addr)
@@ -1120,7 +1150,7 @@ static void macb_tx_error_task(struct work_struct *work)
 						      tx_error_task);
 	bool			halt_timeout = false;
 	struct macb		*bp = queue->bp;
-	struct macb_tx_skb	*tx_skb;
+	struct macb_tx_buf	*tx_buf;
 	struct macb_dma_desc	*desc;
 	struct sk_buff		*skb;
 	unsigned int		tail;
@@ -1160,16 +1190,16 @@ static void macb_tx_error_task(struct work_struct *work)
 
 		desc = macb_tx_desc(queue, tail);
 		ctrl = desc->ctrl;
-		tx_skb = macb_tx_skb(queue, tail);
-		skb = tx_skb->skb;
+		tx_buf = macb_tx_buf(queue, tail);
+		skb = tx_buf->skb;
 
 		if (ctrl & MACB_BIT(TX_USED)) {
 			/* skb is set for the last buffer of the frame */
 			while (!skb) {
-				macb_tx_unmap(bp, tx_skb, 0);
+				macb_tx_unmap(bp, tx_buf, 0, false);
 				tail++;
-				tx_skb = macb_tx_skb(queue, tail);
-				skb = tx_skb->skb;
+				tx_buf = macb_tx_buf(queue, tail);
+				skb = tx_buf->skb;
 			}
 
 			/* ctrl still refers to the first buffer descriptor
@@ -1196,7 +1226,7 @@ static void macb_tx_error_task(struct work_struct *work)
 			desc->ctrl = ctrl | MACB_BIT(TX_USED);
 		}
 
-		macb_tx_unmap(bp, tx_skb, 0);
+		macb_tx_unmap(bp, tx_buf, 0, false);
 	}
 
 	/* Set end of TX queue */
@@ -1273,9 +1303,10 @@ static int macb_tx_complete(struct macb_queue *queue, int budget)
 	spin_lock(&queue->tx_ptr_lock);
 	head = queue->tx_head;
 	for (tail = queue->tx_tail; tail != head && packets < budget; tail++) {
-		struct macb_tx_skb	*tx_skb;
+		struct macb_tx_buf	*tx_buf;
 		struct sk_buff		*skb;
 		struct macb_dma_desc	*desc;
+		enum macb_tx_type	tx_type;
 		u32			ctrl;
 
 		desc = macb_tx_desc(queue, tail);
@@ -1293,18 +1324,19 @@ static int macb_tx_complete(struct macb_queue *queue, int budget)
 
 		/* Process all buffers of the current transmitted frame */
 		for (;; tail++) {
-			tx_skb = macb_tx_skb(queue, tail);
-			skb = tx_skb->skb;
+			tx_buf = macb_tx_buf(queue, tail);
+			skb = tx_buf->skb;
+			tx_type = tx_buf->type;
 
 			/* First, update TX stats if needed */
 			if (skb) {
 				if (unlikely(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP) &&
-				    !ptp_one_step_sync(skb))
+					!ptp_one_step_sync(skb))
 					gem_ptp_do_txstamp(bp, skb, desc);
 
 				netdev_vdbg(bp->dev, "skb %u (data %p) TX complete\n",
-					    macb_tx_ring_wrap(bp, tail),
-					    skb->data);
+						macb_tx_ring_wrap(bp, tail),
+						skb->data);
 				bp->dev->stats.tx_packets++;
 				queue->stats.tx_packets++;
 				bp->dev->stats.tx_bytes += skb->len;
@@ -1313,13 +1345,15 @@ static int macb_tx_complete(struct macb_queue *queue, int budget)
 			}
 
 			/* Now we can safely release resources */
-			macb_tx_unmap(bp, tx_skb, budget);
+			macb_tx_unmap(bp, tx_buf, budget, true);
 
 			/* skb is set only for the last buffer of the frame.
-			 * WARNING: at this point skb has been freed by
-			 * macb_tx_unmap().
-			 */
-			if (skb)
+			* WARNING: at this point skb has been freed by
+			* macb_tx_unmap().
+			*/
+			if ( (tx_type == TX_TYPE_SKB && skb) ||
+			     tx_type == TX_TYPE_XDP_NDO ||
+				 tx_type == TX_TYPE_XDP_TX)
 				break;
 		}
 	}
@@ -1415,6 +1449,225 @@ static void discard_partial_frame(struct macb_queue *queue, unsigned int begin,
 	 */
 }
 
+static enum gem_xdp_verdict
+macb_xdp_submit_frame(struct macb *bp, struct macb_queue *queue,
+                                 struct xdp_frame *xdp_frame, enum macb_tx_type type)
+{
+	// struct skb_shared_info *skb_sinfo = xdp_get_shared_info_from_frame(xdp_frame);
+	struct device *dev = bp->dev->dev.parent;
+	// struct page *page;
+	// int i, num_frames = 1;
+
+	/* TODO: Fragment handling needs to be done first - hope this does not kick in on initial test */
+	// if (unlikely(xdp_frame_has_frags(xdp_frame)))
+	// 	num_frames += skb_sinfo->nr_frags;
+
+	// TODO: make sure our assumption is correct
+	if (unlikely(xdp_frame_has_frags(xdp_frame))) {
+		netdev_err(bp->dev, "macb_xdp_submit_frame got transmit request with fragmented frame which is not supported yet");
+		return DROPPED;
+	}
+
+	// TODO: check if we have descriptors available to send, otherwise return with DROPPED
+
+	/* TODO: Fragment handling needs to be done still - hope this does not kick in on initial test */
+	/* for(i = 0; i < num_frames; i++) */ {
+		int len = xdp_frame->len;
+		u32 ctrl;
+		//skb_frag_t *frag = NULL;
+		struct macb_dma_desc *desc;
+		struct macb_tx_buf *tx_buf;
+		dma_addr_t paddr;
+		struct page *page;
+
+		/* TODO: Fragment handling needs to be done still */
+		// if (unlikely(i)) {
+		// 	frag = &skb_sinfo->frags[i - 0];
+		// 	len = skb_frag_size(frag);
+		// }
+
+		switch (type) {
+			case TX_TYPE_XDP_NDO:
+				paddr = dma_map_single(dev, xdp_frame->data, len, DMA_TO_DEVICE);
+
+				if (dma_mapping_error(dev, paddr)) {
+					netdev_err(bp->dev, "macb_xdp_submit_frame was not able to map frame to DMA");
+					return DROPPED;
+				}
+				break;
+			case TX_TYPE_XDP_TX:
+				/* TODO: Framgent handling needs to be done still */
+				page = virt_to_page(xdp_frame->data);
+				paddr = page_pool_get_dma_addr(page);
+				paddr += sizeof(*xdp_frame) + xdp_frame->headroom;
+				dma_sync_single_for_device(dev, paddr, len, DMA_BIDIRECTIONAL);
+				break;
+			default:
+				return DROPPED;
+		}
+
+		tx_buf = macb_tx_buf(queue, queue->tx_head);
+		tx_buf->xdp_frame = xdp_frame;
+		tx_buf->mapping = paddr;
+		tx_buf->size = len;
+		tx_buf->type = type;
+		desc = macb_tx_desc(queue, queue->tx_head);
+		ctrl = MACB_BIT(TX_USED);
+		desc->ctrl = ctrl;
+
+		ctrl = (u32)len;
+		ctrl |= MACB_BIT(TX_LAST);
+		if (unlikely(macb_tx_ring_wrap(bp, queue->tx_head) == (bp->tx_ring_size - 1)))
+			ctrl |= MACB_BIT(TX_WRAP);
+		ctrl |= MACB_BF(TX_LSO, 0);
+		ctrl |= MACB_BF(TX_TCP_SEQ_SRC, 0);
+		macb_set_addr(bp, desc, paddr);
+		wmb();
+		desc->ctrl = ctrl;
+		queue->tx_head++;
+	}
+
+	return TX;
+}
+
+static enum gem_xdp_verdict
+macb_xdp_xmit_back(struct macb *bp, struct xdp_buff *xdp_buf)
+{
+	struct macb_queue *queue;
+	struct netdev_queue *nqueue;
+	int cpu;
+	struct xdp_frame *xdp_frame;
+
+	xdp_frame = xdp_convert_buff_to_frame(xdp_buf);
+	if(unlikely(!xdp_frame))
+		return DROPPED;
+
+	cpu = smp_processor_id();
+	queue = &bp->queues[cpu % bp->num_queues];
+	nqueue = netdev_get_tx_queue(bp->dev, queue->id);
+
+	__netif_tx_lock(nqueue, cpu);
+	if(macb_xdp_submit_frame(bp, queue, xdp_frame, TX_TYPE_XDP_TX) != TX) {
+		queue->stats.rx_xdp_tx_errors += 1;
+		return DROPPED;
+	}
+
+	wmb();
+
+	spin_lock_irq(&bp->lock);
+	/* TSTART write might get dropped, so make the IRQ retrigger a buffer read */
+	if (macb_readl(bp, TSR) & MACB_BIT(TGO))
+		queue->tx_pending = 1;
+
+	macb_writel(bp, NCR, macb_readl(bp, NCR) | MACB_BIT(TSTART));
+	spin_unlock_irq(&bp->lock);
+
+	__netif_tx_unlock(nqueue);
+
+	queue->stats.tx_bytes += xdp_frame->len;
+	queue->stats.tx_packets++;
+	queue->stats.rx_xdp_tx++;
+	
+	return TX;
+}
+
+static int
+macb_xdp_xmit(struct net_device *dev,
+			     int num_frames,
+			     struct xdp_frame **frames,
+			     u32 flags)
+{
+	struct macb *bp = netdev_priv(dev);
+	struct netdev_queue *nqueue;
+	int cpu = smp_processor_id();
+	struct macb_queue *queue;
+	int i, frames_xmit = 0, bytes_xmit = 0;
+
+	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
+		return -EINVAL;
+	
+	queue = &bp->queues[cpu % bp->num_queues];
+	nqueue = netdev_get_tx_queue(bp->dev, queue->id);
+
+	__netif_tx_lock(nqueue, cpu);
+	for(i = 0; i < num_frames; i++) {
+		struct xdp_frame *xdp_frame = frames[i];
+		if (macb_xdp_submit_frame(bp, queue, xdp_frame, TX_TYPE_XDP_NDO) != TX)
+			break;
+		bytes_xmit += xdp_frame->len;
+		frames_xmit++;
+	}
+
+	wmb();
+
+	spin_lock_irq(&bp->lock);
+	/* TSTART write might get dropped, so make the IRQ retrigger a buffer read */
+	if (macb_readl(bp, TSR) & MACB_BIT(TGO))
+		queue->tx_pending = 1;
+
+	macb_writel(bp, NCR, macb_readl(bp, NCR) | MACB_BIT(TSTART));
+	spin_unlock_irq(&bp->lock);
+
+	__netif_tx_unlock(nqueue);
+
+	queue->stats.tx_bytes += bytes_xmit;
+	queue->stats.tx_packets += frames_xmit;
+	queue->stats.tx_xdp_xmit += frames_xmit;
+	queue->stats.tx_xdp_xmit_errors += (num_frames - frames_xmit);
+
+	return frames_xmit;
+}
+
+static enum gem_xdp_verdict
+gem_run_xdp(struct macb *bp, struct bpf_prog *prog,
+		 struct xdp_buff *xdp, struct macb_queue *queue)
+{
+	unsigned int sync, len = xdp->data_end - xdp->data;
+	struct page *page;
+	u32 act;
+
+	act = bpf_prog_run_xdp(prog, xdp);
+
+	/* Due xdp_adjust_tail: DMA sync for_device cover max len CPU touch */
+	sync = xdp->data_end - xdp->data_hard_start - GEM_RX_PAGE_HEADROOM;
+	sync = max(sync, len);
+
+	switch (act) {
+	case XDP_PASS:
+		queue->stats.rx_xdp_pass++;
+		return PASS;
+
+	case XDP_REDIRECT:
+		queue->stats.rx_xdp_redirect++;
+		if (xdp_do_redirect(bp->dev, xdp, prog) == 0) {
+			return REDIRECT;
+		}
+		break;
+
+	case XDP_TX:
+		if(macb_xdp_xmit_back(bp, xdp) == TX) {
+			/* statsitics are handled in function call */
+			return TX;
+		}
+		break;
+
+	default:
+		bpf_warn_invalid_xdp_action(bp->dev, prog, act);
+		break;
+
+	case XDP_ABORTED:
+		break;
+
+	case XDP_DROP:
+		break;
+	}
+
+	queue->stats.rx_xdp_drop++;
+	page = virt_to_head_page(xdp->data);
+	page_pool_put_page(queue->page_pool, page, sync, true);
+	return DROPPED;
+}
+
 static int gem_rx(struct macb_queue *queue, struct napi_struct *napi,
 		  int budget)
 {
@@ -1425,7 +1678,13 @@ static int gem_rx(struct macb_queue *queue, struct napi_struct *napi,
 	struct page			*page;
 	struct macb_dma_desc	*desc;
 	u32 data_start = GEM_RX_PAGE_HEADROOM;
+	struct bpf_prog *xdp_prog = READ_ONCE(bp->xdp_prog);
+	enum gem_xdp_verdict xdp_verdict;
+	struct xdp_buff xdp_buf;
+	bool xdp_once_redirected = false;
 	int			count = 0;
+
+	xdp_init_buff(&xdp_buf, PAGE_SIZE, &queue->xdp_rxq);
 
 	while (count < budget) {
 		u32 ctrl;
@@ -1473,6 +1732,18 @@ static int gem_rx(struct macb_queue *queue, struct napi_struct *napi,
 
 		netdev_vdbg(bp->dev, "gem_rx %u (len %u)\n", entry, len);
 
+		if (xdp_prog) {
+			xdp_buff_clear_frags_flag(&xdp_buf);
+			xdp_prepare_buff(&xdp_buf, page_address(page),
+					 GEM_RX_PAGE_HEADROOM, len, false);
+
+			xdp_verdict = gem_run_xdp(bp, xdp_prog, &xdp_buf, queue);
+			if(xdp_verdict == REDIRECT)
+				xdp_once_redirected = true;
+			if (xdp_verdict != PASS)
+				continue;
+		}
+
 		skb = build_skb(page_address(page), PAGE_SIZE);
 		if (unlikely(!skb)) {
 			netdev_err(bp->dev,
@@ -1513,6 +1784,9 @@ static int gem_rx(struct macb_queue *queue, struct napi_struct *napi,
 	}
 
 	gem_rx_refill(queue);
+
+	if (xdp_once_redirected)
+		xdp_do_flush_map();
 
 	return count;
 }
@@ -2079,8 +2353,8 @@ static unsigned int macb_tx_map(struct macb *bp,
 				unsigned int hdrlen)
 {
 	dma_addr_t mapping;
-	unsigned int len, entry, i, tx_head = queue->tx_head;
-	struct macb_tx_skb *tx_skb = NULL;
+	unsigned int len, i, tx_head = queue->tx_head;
+	struct macb_tx_buf *tx_buf = NULL;
 	struct macb_dma_desc *desc;
 	unsigned int offset, size, count = 0;
 	unsigned int f, nr_frags = skb_shinfo(skb)->nr_frags;
@@ -2105,8 +2379,7 @@ static unsigned int macb_tx_map(struct macb *bp,
 
 	offset = 0;
 	while (len) {
-		entry = macb_tx_ring_wrap(bp, tx_head);
-		tx_skb = &queue->tx_skb[entry];
+		tx_buf = macb_tx_buf(queue, tx_head);
 
 		mapping = dma_map_single(&bp->pdev->dev,
 					 skb->data + offset,
@@ -2115,10 +2388,11 @@ static unsigned int macb_tx_map(struct macb *bp,
 			goto dma_error;
 
 		/* Save info to properly release resources */
-		tx_skb->skb = NULL;
-		tx_skb->mapping = mapping;
-		tx_skb->size = size;
-		tx_skb->mapped_as_page = false;
+		tx_buf->skb = NULL;
+		tx_buf->mapping = mapping;
+		tx_buf->size = size;
+		tx_buf->mapped_as_page = false;
+		tx_buf->type = TX_TYPE_SKB;
 
 		len -= size;
 		offset += size;
@@ -2136,8 +2410,7 @@ static unsigned int macb_tx_map(struct macb *bp,
 		offset = 0;
 		while (len) {
 			size = min(len, bp->max_tx_length);
-			entry = macb_tx_ring_wrap(bp, tx_head);
-			tx_skb = &queue->tx_skb[entry];
+			tx_buf = macb_tx_buf(queue, tx_head);
 
 			mapping = skb_frag_dma_map(&bp->pdev->dev, frag,
 						   offset, size, DMA_TO_DEVICE);
@@ -2145,10 +2418,11 @@ static unsigned int macb_tx_map(struct macb *bp,
 				goto dma_error;
 
 			/* Save info to properly release resources */
-			tx_skb->skb = NULL;
-			tx_skb->mapping = mapping;
-			tx_skb->size = size;
-			tx_skb->mapped_as_page = true;
+			tx_buf->skb = NULL;
+			tx_buf->mapping = mapping;
+			tx_buf->size = size;
+			tx_buf->mapped_as_page = true;
+			tx_buf->type = TX_TYPE_SKB;
 
 			len -= size;
 			offset += size;
@@ -2158,13 +2432,13 @@ static unsigned int macb_tx_map(struct macb *bp,
 	}
 
 	/* Should never happen */
-	if (unlikely(!tx_skb)) {
-		netdev_err(bp->dev, "BUG! empty skb!\n");
+	if (unlikely(!tx_buf)) {
+		netdev_err(bp->dev, "BUG! empty tx buffer!\n");
 		return 0;
 	}
 
 	/* This is the last buffer of the frame: save socket buffer */
-	tx_skb->skb = skb;
+	tx_buf->skb = skb;
 
 	/* Update TX ring: update buffer descriptors in reverse order
 	 * to avoid race condition
@@ -2174,9 +2448,8 @@ static unsigned int macb_tx_map(struct macb *bp,
 	 * to set the end of TX queue
 	 */
 	i = tx_head;
-	entry = macb_tx_ring_wrap(bp, i);
 	ctrl = MACB_BIT(TX_USED);
-	desc = macb_tx_desc(queue, entry);
+	desc = macb_tx_desc(queue, i);
 	desc->ctrl = ctrl;
 
 	if (lso_ctrl) {
@@ -2196,16 +2469,15 @@ static unsigned int macb_tx_map(struct macb *bp,
 
 	do {
 		i--;
-		entry = macb_tx_ring_wrap(bp, i);
-		tx_skb = &queue->tx_skb[entry];
-		desc = macb_tx_desc(queue, entry);
+		tx_buf = macb_tx_buf(queue, i);
+		desc = macb_tx_desc(queue, i);
 
-		ctrl = (u32)tx_skb->size;
+		ctrl = (u32)tx_buf->size;
 		if (eof) {
 			ctrl |= MACB_BIT(TX_LAST);
 			eof = 0;
 		}
-		if (unlikely(entry == (bp->tx_ring_size - 1)))
+		if (unlikely(macb_tx_ring_wrap(bp, i) == (bp->tx_ring_size - 1)))
 			ctrl |= MACB_BIT(TX_WRAP);
 
 		/* First descriptor is header descriptor */
@@ -2223,7 +2495,7 @@ static unsigned int macb_tx_map(struct macb *bp,
 			ctrl |= MACB_BF(MSS_MFS, mss_mfs);
 
 		/* Set TX buffer descriptor */
-		macb_set_addr(bp, desc, tx_skb->mapping);
+		macb_set_addr(bp, desc, tx_buf->mapping);
 		/* desc->addr must be visible to hardware before clearing
 		 * 'TX_USED' bit in desc->ctrl.
 		 */
@@ -2239,9 +2511,9 @@ dma_error:
 	netdev_err(bp->dev, "TX DMA map failed\n");
 
 	for (i = queue->tx_head; i != tx_head; i++) {
-		tx_skb = macb_tx_skb(queue, i);
+		tx_buf = macb_tx_buf(queue, i);
 
-		macb_tx_unmap(bp, tx_skb, 0);
+		macb_tx_unmap(bp, tx_buf, 0, false);
 	}
 
 	return 0;
@@ -2534,8 +2806,8 @@ static void macb_free_consistent(struct macb *bp)
 	bp->macbgem_ops.mog_free_rx_buffers(bp);
 
 	for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue) {
-		kfree(queue->tx_skb);
-		queue->tx_skb = NULL;
+		kfree(queue->tx_buf);
+		queue->tx_buf = NULL;
 		if (queue->tx_ring) {
 			size = TX_RING_BYTES(bp) + bp->tx_bd_rd_prefetch;
 			dma_free_coherent(&bp->pdev->dev, size,
@@ -2553,13 +2825,14 @@ static void macb_free_consistent(struct macb *bp)
 
 static int gem_create_page_pool(struct macb *bp, struct macb_queue *queue)
 {
+	struct bpf_prog *xdp_prog = READ_ONCE(bp->xdp_prog);
 	struct page_pool_params pp_params = {
 		.order = 0,
 		.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
 		.pool_size = (bp->rx_ring_size * GEM_RX_PAGE_FRAMES_PER_PAGE),
 		.nid = dev_to_node(&bp->pdev->dev),
 		.dev = &bp->pdev->dev,
-		.dma_dir = DMA_FROM_DEVICE,
+		.dma_dir = xdp_prog ? DMA_BIDIRECTIONAL : DMA_FROM_DEVICE,
 		.offset = GEM_RX_PAGE_HEADROOM,
 		.max_len = GEM_RX_PAGE_MAX_FRAME_SIZE,
 	};
@@ -2600,7 +2873,6 @@ static int gem_alloc_rx_buffers(struct macb *bp)
 	int ret;
 
 	for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue) {
-		queue->id = q;
 		ret = gem_create_page_pool(bp, queue);
 		if(ret != 0) {
 			netdev_err(bp->dev,
@@ -2654,9 +2926,9 @@ static int macb_alloc_consistent(struct macb *bp)
 			   q, size, (unsigned long)queue->tx_ring_dma,
 			   queue->tx_ring);
 
-		size = bp->tx_ring_size * sizeof(struct macb_tx_skb);
-		queue->tx_skb = kmalloc(size, GFP_KERNEL);
-		if (!queue->tx_skb)
+		size = bp->tx_ring_size * sizeof(struct macb_tx_buf);
+		queue->tx_buf = kmalloc(size, GFP_KERNEL);
+		if (!queue->tx_buf)
 			goto out_err;
 
 		size = RX_RING_BYTES(bp) + bp->rx_bd_rd_prefetch;
@@ -2682,11 +2954,17 @@ static void gem_init_rings(struct macb *bp)
 {
 	struct macb_queue *queue;
 	struct macb_dma_desc *desc = NULL;
+	struct macb_tx_buf *tx_buf;
 	unsigned int q;
 	int i;
 
 	for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue) {
+		queue->id = q;
 		for (i = 0; i < bp->tx_ring_size; i++) {
+			tx_buf = macb_tx_buf(queue, i);
+			tx_buf->skb = NULL;
+			tx_buf->xdp_frame = NULL;
+			tx_buf->type = TX_TYPE_UNUSED;
 			desc = macb_tx_desc(queue, i);
 			macb_set_addr(bp, desc, 0);
 			desc->ctrl = MACB_BIT(TX_USED);
@@ -3154,6 +3432,35 @@ static int macb_close(struct net_device *dev)
 	pm_runtime_put(&bp->pdev->dev);
 
 	return 0;
+}
+
+static int macb_bpf(struct net_device *dev, struct netdev_bpf *bpf)
+{
+	struct macb *bp = netdev_priv(dev);
+	bool is_run = netif_running(dev);
+	struct bpf_prog *old_prog;
+
+	switch (bpf->command) {
+	case XDP_SETUP_PROG:
+		if (is_run)
+			macb_close(dev);
+
+		old_prog = xchg(&bp->xdp_prog, bpf->prog);
+
+		if (is_run)
+			macb_open(dev);
+
+		if (old_prog)
+			bpf_prog_put(old_prog);
+
+		return 0;
+
+	case XDP_SETUP_XSK_POOL:
+		return -EOPNOTSUPP;
+
+	default:
+		return -EOPNOTSUPP;
+	}
 }
 
 static int macb_change_mtu(struct net_device *dev, int new_mtu)
@@ -4098,6 +4405,8 @@ static const struct net_device_ops macb_netdev_ops = {
 #endif
 	.ndo_set_features	= macb_set_features,
 	.ndo_features_check	= macb_features_check,
+	.ndo_bpf			= macb_bpf,
+	.ndo_xdp_xmit		= macb_xdp_xmit,
 };
 
 /* Configure peripheral capabilities according to device tree
@@ -4368,6 +4677,11 @@ static int macb_init(struct platform_device *pdev)
 	if (bp->caps & MACB_CAPS_SG_DISABLED)
 		dev->hw_features &= ~NETIF_F_SG;
 	dev->features = dev->hw_features;
+
+	/* XDP feature set */
+	dev->xdp_features = NETDEV_XDP_ACT_BASIC |
+				     	NETDEV_XDP_ACT_REDIRECT |
+				     	NETDEV_XDP_ACT_NDO_XMIT;
 
 	/* Check RX Flow Filters support.
 	 * Max Rx flows set by availability of screeners & compare regs:

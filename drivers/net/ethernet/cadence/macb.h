@@ -946,7 +946,15 @@ struct macb_dma_desc_ptp {
 /* Scaled PPM fraction */
 #define PPM_FRACTION	16
 
-/* struct macb_tx_skb - data about an skb which is being transmitted
+/* Defines the type of data structure used for sending a frame */
+enum macb_tx_type {
+	TX_TYPE_UNUSED = 0,
+	TX_TYPE_SKB,
+	TX_TYPE_XDP_NDO,
+	TX_TYPE_XDP_TX,
+};
+
+/* struct macb_tx_buf - data about an skb which is being transmitted
  * @skb: skb currently being transmitted, only set for the last buffer
  *       of the frame
  * @mapping: DMA address of the skb's fragment buffer
@@ -954,8 +962,10 @@ struct macb_dma_desc_ptp {
  * @mapped_as_page: true when buffer was mapped with skb_frag_dma_map(),
  *                  false when buffer was mapped with dma_map_single()
  */
-struct macb_tx_skb {
+struct macb_tx_buf {
 	struct sk_buff		*skb;
+	struct xdp_frame	*xdp_frame;
+	enum macb_tx_type	type;
 	dma_addr_t		mapping;
 	size_t			size;
 	bool			mapped_as_page;
@@ -1152,6 +1162,13 @@ struct queue_stats {
 	unsigned long tx_packets;
 	unsigned long tx_bytes;
 	unsigned long tx_dropped;
+	unsigned long rx_xdp_redirect;
+	unsigned long rx_xdp_pass;
+	unsigned long rx_xdp_drop;
+	unsigned long rx_xdp_tx;
+	unsigned long rx_xdp_tx_errors;
+	unsigned long tx_xdp_xmit;
+	unsigned long tx_xdp_xmit_errors;
 };
 
 static const struct gem_statistic queue_statistics[] = {
@@ -1161,6 +1178,13 @@ static const struct gem_statistic queue_statistics[] = {
 		QUEUE_STAT_TITLE("tx_packets"),
 		QUEUE_STAT_TITLE("tx_bytes"),
 		QUEUE_STAT_TITLE("tx_dropped"),
+		QUEUE_STAT_TITLE("rx_xdp_redirect"),
+		QUEUE_STAT_TITLE("rx_xdp_pass"),
+		QUEUE_STAT_TITLE("rx_xdp_drop"),
+		QUEUE_STAT_TITLE("rx_xdp_tx"),
+		QUEUE_STAT_TITLE("rx_xdp_tx_errors"),
+		QUEUE_STAT_TITLE("tx_xdp_xmit"),
+		QUEUE_STAT_TITLE("tx_xdp_xmit_erros"),
 };
 
 #define QUEUE_STATS_LEN ARRAY_SIZE(queue_statistics)
@@ -1238,7 +1262,7 @@ struct macb_queue {
 	spinlock_t		tx_ptr_lock;
 	unsigned int		tx_head, tx_tail;
 	struct macb_dma_desc	*tx_ring;
-	struct macb_tx_skb	*tx_skb;
+	struct macb_tx_buf	*tx_buf;
 	dma_addr_t		tx_ring_dma;
 	struct work_struct	tx_error_task;
 	bool			txubr_pending;
@@ -1319,7 +1343,7 @@ struct macb {
 	int			phy_reset_ms;
 
 	/* AT91RM9200 transmit queue (1 on wire + 1 queued) */
-	struct macb_tx_skb	rm9200_txq[2];
+	struct macb_tx_buf	rm9200_txq[2];
 	unsigned int		max_tx_length;
 
 	u64			ethtool_stats[GEM_STATS_LEN + QUEUE_STATS_LEN * MACB_MAX_QUEUES];
@@ -1360,6 +1384,9 @@ struct macb {
 
 	struct macb_pm_data pm_data;
 	const struct macb_usrio_config *usrio;
+
+	/* XDP BPF Program */
+	struct bpf_prog *xdp_prog;
 };
 
 #ifdef CONFIG_MACB_USE_HWSTAMP
